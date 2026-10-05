@@ -42,12 +42,6 @@ public class EvapPanController {
         return ApiResponse.success("罐体已建档", panService.create(input));
     }
 
-    /** 洗罐闭环 */
-    @PostMapping("/{id}/wash")
-    public ApiResponse<EvapPan> wash(@PathVariable Long id) {
-        return ApiResponse.success("洗罐已记录", panService.wash(id));
-    }
-
     @PostMapping("/{id}/transfer")
     public ApiResponse<EvapPan> transfer(@PathVariable Long id, @RequestParam String target) {
         return ApiResponse.success("状态已更新", panService.transfer(id, target));

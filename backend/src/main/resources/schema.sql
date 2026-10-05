@@ -11,6 +11,10 @@ SET character_set_results = utf8mb4;
 -- 落库时摊平成本表的 brix / purity / fiber 三列。
 -- 投料交接闭环：cane_intake.allocated_kg（已交接净重）与 press_station.occupied_kg
 -- （已占用千克）由交接事务维护，feed_batch 落每一笔投料批；三处数值同事务起落。
+-- 洗罐排程闭环：wash_schedule 落每一条洗罐安排，状态 待执行→清洗中→已完成（待执行可取消）；
+-- 完成时同事务刷 evap_pan.last_wash_at 并把罐置回「运行」（恢复运行资格）。
+-- active_pan_key 是生成列：未完成安排（待执行/清洗中）= pan_id，终态为 NULL，
+-- 配唯一索引在库层兜底「同一罐不能同时存在两个未完成的洗罐安排」。
 
 CREATE DATABASE IF NOT EXISTS sugar_refinery
   DEFAULT CHARACTER SET utf8mb4
@@ -21,6 +25,7 @@ USE sugar_refinery;
 SET FOREIGN_KEY_CHECKS = 0;
 DROP TABLE IF EXISTS feed_batch;
 DROP TABLE IF EXISTS sugar_batch;
+DROP TABLE IF EXISTS wash_schedule;
 DROP TABLE IF EXISTS evap_pan;
 DROP TABLE IF EXISTS press_station;
 DROP TABLE IF EXISTS cane_intake;
@@ -99,6 +104,38 @@ CREATE TABLE evap_pan (
     last_wash_at DATETIME
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- ---------------- 洗罐安排（洗罐排程单） ----------------
+CREATE TABLE wash_schedule (
+    id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+    schedule_no     VARCHAR(32) NOT NULL UNIQUE COMMENT '洗罐安排号',
+    request_id      VARCHAR(36) NOT NULL UNIQUE COMMENT '幂等键：同一排程请求只落一条',
+    pan_id          BIGINT NOT NULL COMMENT '目标罐',
+    pan_code        VARCHAR(24) NOT NULL COMMENT '罐号快照',
+    pan_name        VARCHAR(64) NOT NULL COMMENT '罐名快照',
+    pan_type        VARCHAR(16) NOT NULL COMMENT '罐型快照（清洗中不能改换罐型）',
+    window_start    DATETIME NOT NULL COMMENT '洗罐窗口开始',
+    window_end      DATETIME NOT NULL COMMENT '洗罐窗口结束',
+    status          VARCHAR(16) NOT NULL COMMENT '待执行/清洗中/已完成/已取消',
+    created_at      DATETIME,
+    started_at      DATETIME COMMENT '首次开始清洗时间',
+    completed_at    DATETIME COMMENT '完成时间（与 last_wash_at 同事务写入）',
+    cancelled_at    DATETIME,
+    last_attempt_at DATETIME COMMENT '末次尝试时间（开始/重试刷新，失败后凭它重试）',
+    failure_reason  VARCHAR(255) COMMENT '清洗失败原因；非空=停在清洗中等重试',
+    fail_count      INT NOT NULL DEFAULT 0,
+    -- 生成列：未完成安排活动键 = pan_id，终态为 NULL
+    active_pan_key  BIGINT GENERATED ALWAYS AS
+                    (CASE WHEN status IN ('待执行','清洗中') THEN pan_id ELSE NULL END) STORED,
+    CONSTRAINT fk_wash_pan FOREIGN KEY (pan_id) REFERENCES evap_pan(id),
+    CONSTRAINT ck_wash_window CHECK (window_end > window_start),
+    -- 防线：同一罐同时只允许一条未完成安排
+    CONSTRAINT uq_wash_active_pan UNIQUE (active_pan_key),
+    -- 防线：进入清洗中必须有洗罐开始时间；完成必须有完成时间（不能只改状态没有洗罐时间）
+    CONSTRAINT ck_wash_started CHECK (
+        status NOT IN ('清洗中','已完成') OR (started_at IS NOT NULL AND last_attempt_at IS NOT NULL)),
+    CONSTRAINT ck_wash_completed CHECK (status <> '已完成' OR completed_at IS NOT NULL)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- ---------------- 成品糖批次 ----------------
 CREATE TABLE sugar_batch (
     id          BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -148,8 +185,31 @@ INSERT INTO evap_pan (pan_code, pan_name, pan_type, capacity_m3, status, last_wa
 ('EP-01', '1号蒸发罐', '蒸发罐', 120.00, '运行', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 2 DAY),
 ('EP-02', '2号蒸发罐', '蒸发罐', 110.00, '运行', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 5 DAY),
 ('EP-03', '3号蒸发罐', '蒸发罐', 100.00, '洗罐', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 8 HOUR),
+('EP-04', '4号蒸发罐', '蒸发罐',  95.00, '运行', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 30 HOUR),
 ('CP-01', '1号结晶罐', '结晶罐',  80.00, '运行', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 1 DAY),
 ('CP-02', '2号结晶罐', '结晶罐',  75.00, '停用', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 6 DAY);
+
+-- 洗罐排程种子（与 evap_pan 状态严格对账）：
+-- WS-…001：EP-02 待执行（已排今晚窗口，罐仍运行；超 72h 未洗待开始）
+-- WS-…002：EP-03 清洗中且清洗失败 1 次（failure_reason 非空，罐停洗罐、last_wash_at 不变，可安全重试）
+-- WS-…003：EP-04 已完成（2 小时前完成，last_wash_at 与 completed_at 对齐，运行资格已恢复）
+INSERT INTO wash_schedule
+(schedule_no, request_id, pan_id, pan_code, pan_name, pan_type, window_start, window_end,
+ status, created_at, started_at, completed_at, cancelled_at, last_attempt_at, failure_reason, fail_count) VALUES
+('WS-SEED0001', 'seed-wash-0001', 2, 'EP-02', '2号蒸发罐', '蒸发罐',
+ UTC_TIMESTAMP() + INTERVAL 8 HOUR + INTERVAL 2 HOUR, UTC_TIMESTAMP() + INTERVAL 8 HOUR + INTERVAL 5 HOUR,
+ '待执行', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 1 HOUR, NULL, NULL, NULL, NULL, NULL, 0),
+('WS-SEED0002', 'seed-wash-0002', 3, 'EP-03', '3号蒸发罐', '蒸发罐',
+ UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 10 HOUR, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 6 HOUR,
+ '清洗中', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 11 HOUR,
+ UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 9 HOUR, NULL, NULL,
+ UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 7 HOUR, '清洗后取样锤度不达标，需重新冲洗', 1),
+('WS-SEED0003', 'seed-wash-0003', 4, 'EP-04', '4号蒸发罐', '蒸发罐',
+ UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 4 HOUR, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 2 HOUR,
+ '已完成', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 5 HOUR,
+ UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 4 HOUR,
+ UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 2 HOUR, NULL,
+ UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 2 HOUR, NULL, 0);
 
 INSERT INTO sugar_batch (batch_no, grade, quantity_kg, brix, purity, fiber, warehouse, status, produced_at) VALUES
 ('SB-2026001', '白砂糖', 48000.00, 99.90, 99.70, 0.00, '1号糖仓', '已入库', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 2 DAY),

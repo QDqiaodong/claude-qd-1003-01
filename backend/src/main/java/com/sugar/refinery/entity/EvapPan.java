@@ -10,6 +10,9 @@ import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
 import jakarta.persistence.Transient;
+
+import com.sugar.refinery.common.Dict;
+
 import lombok.Getter;
 import lombok.Setter;
 
@@ -61,10 +64,10 @@ public class EvapPan {
         return java.time.Duration.between(lastWashAt, LocalDateTime.now()).toHours();
     }
 
-    /** 是否该洗罐，派生字段 */
+    /** 是否该洗罐（距上次洗罐超过 {@link Dict#PAN_WASH_DUE_HOURS} 小时），派生字段 */
     @Transient
     public boolean isWashDue() {
         Long h = getHoursSinceWash();
-        return h != null && h > 72;
+        return h != null && h > Dict.PAN_WASH_DUE_HOURS;
     }
 }

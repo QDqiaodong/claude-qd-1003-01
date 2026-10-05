@@ -51,6 +51,20 @@ public final class Dict {
             "洗罐", List.of("运行", "停用"),
             "停用", List.of("洗罐"));
 
+    // ---------------- 洗罐排程 ----------------
+    /** 洗罐安排状态：待执行 / 清洗中 / 已完成 / 已取消 */
+    public static final List<String> WASH_STATUSES = List.of("待执行", "清洗中", "已完成", "已取消");
+
+    /** 待执行 → 清洗中 → 已完成；待执行可取消；清洗中（含清洗失败）只能重试或完成 */
+    private static final Map<String, List<String>> WASH_NEXT = Map.of(
+            "待执行", List.of("清洗中", "已取消"),
+            "清洗中", List.of("已完成"),
+            "已完成", List.of(),
+            "已取消", List.of());
+
+    /** 距上次洗罐超过该小时数必须先洗罐，不允许继续运行 */
+    public static final long PAN_WASH_DUE_HOURS = 72;
+
     // ---------------- 成品糖 ----------------
     /** 品类：白砂糖 / 赤砂糖 / 绵白糖 / 冰糖 */
     public static final List<String> SUGAR_GRADES = List.of("白砂糖", "赤砂糖", "绵白糖", "冰糖");
@@ -120,6 +134,19 @@ public final class Dict {
 
     public static boolean canTransferPan(String from, String to) {
         return PAN_NEXT.getOrDefault(from, List.of()).contains(to);
+    }
+
+    public static boolean isValidWashStatus(String s) {
+        return s != null && WASH_STATUSES.contains(s);
+    }
+
+    public static boolean canTransferWash(String from, String to) {
+        return WASH_NEXT.getOrDefault(from, List.of()).contains(to);
+    }
+
+    /** 未完成的洗罐安排：待执行 / 清洗中（同一罐同时只允许一条） */
+    public static boolean isWashOpen(String s) {
+        return "待执行".equals(s) || "清洗中".equals(s);
     }
 
     public static boolean isValidSugarGrade(String g) {
