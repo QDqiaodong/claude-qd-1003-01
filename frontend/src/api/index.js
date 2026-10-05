@@ -50,6 +50,16 @@ export default {
   transferPan: (id, target) => call(http.post(`/evap-pans/${id}/transfer`, null, params({ target }))),
   runningCapacity: () => call(http.get('/evap-pans/running-capacity')),
 
+  // ---------------- 蒸发结晶罐洗罐排程 ----------------
+  washQueue: (p) => call(http.get('/pan-washes/queue', params(p))),
+  listWashes: (p) => call(http.get('/pan-washes', params(p))),
+  scheduleWash: (panId, windowAt) =>
+    call(http.post('/pan-washes', null, params({ panId, windowAt }))),
+  startWash: (id) => call(http.post(`/pan-washes/${id}/start`)),
+  cancelWash: (id) => call(http.post(`/pan-washes/${id}/cancel`)),
+  completeWash: (id) => call(http.post(`/pan-washes/${id}/complete`)),
+  executeWash: (id) => call(http.post(`/pan-washes/${id}/execute`)),
+
   // ---------------- 成品糖批次 ----------------
   listBatches: (p) => call(http.get('/sugar-batches', params(p))),
   createBatch: (d) => call(http.post('/sugar-batches', d)),

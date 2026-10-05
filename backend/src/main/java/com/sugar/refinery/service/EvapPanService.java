@@ -10,7 +10,9 @@ import org.springframework.transaction.annotation.Transactional;
 import com.sugar.refinery.common.BizException;
 import com.sugar.refinery.common.Dict;
 import com.sugar.refinery.entity.EvapPan;
+import com.sugar.refinery.entity.PanWash;
 import com.sugar.refinery.repository.EvapPanRepository;
+import com.sugar.refinery.repository.PanWashRepository;
 
 /**
  * 蒸发 / 结晶罐业务。
@@ -18,14 +20,19 @@ import com.sugar.refinery.repository.EvapPanRepository;
  * <p>核心规则：① 罐型只能是蒸发罐或结晶罐，容积必须大于 0；
  * ② 洗罐中的罐不允许进新料（不允许直接转运行，必须先洗完）；
  * ③ 距上次洗罐超过 72 小时不允许继续运行，必须先洗罐。</p>
+ *
+ * <p>洗罐排程闭环期间，罐体「运行 ↔ 洗罐」由 {@link PanWashService} 在同一事务联动维护，
+ * 手工状态流转不能绕过它：清洗中不许手动转任何状态，有待执行安排时不许手动转入洗罐。</p>
  */
 @Service
 public class EvapPanService {
 
     private final EvapPanRepository panRepository;
+    private final PanWashRepository washRepository;
 
-    public EvapPanService(EvapPanRepository panRepository) {
+    public EvapPanService(EvapPanRepository panRepository, PanWashRepository washRepository) {
         this.panRepository = panRepository;
+        this.washRepository = washRepository;
     }
 
     public List<EvapPan> list(String panType, String status) {
@@ -70,12 +77,21 @@ public class EvapPanService {
         return panRepository.save(p);
     }
 
-    /** 洗罐闭环：记录本次洗罐时间 */
+    /**
+     * 直接记录一次洗罐（老入口）。排程闭环上线后，正常洗罐应走洗罐安排
+     * （待执行 → 清洗中 → 已完成）；此入口仍保留，但同样受互锁保护：
+     * 停用中的罐不能洗，已有未完成安排的罐不能绕过安排直接洗。
+     */
     @Transactional
     public EvapPan wash(Long id) {
         EvapPan p = get(id);
         if ("停用".equals(p.getStatus())) {
             throw new BizException("停用中的罐不能直接洗罐，请先转为洗罐状态");
+        }
+        PanWash active = findActiveWash(id);
+        if (active != null) {
+            throw new BizException("该罐存在「" + active.getStatus() + "」的洗罐安排 "
+                    + active.getWashNo() + "，请在洗罐排程里推进或取消，不能绕过安排直接洗罐");
         }
         p.setLastWashAt(LocalDateTime.now());
         return panRepository.save(p);
@@ -90,13 +106,30 @@ public class EvapPanService {
         if (!Dict.canTransferPan(p.getStatus(), target)) {
             throw new BizException("不允许从「" + p.getStatus() + "」转为「" + target + "」");
         }
+        PanWash active = findActiveWash(id);
+        if (active != null) {
+            if ("清洗中".equals(active.getStatus())) {
+                throw new BizException("洗罐安排 " + active.getWashNo()
+                        + " 清洗中，请完成该安排（完成时自动恢复运行），不能手动改罐体状态");
+            }
+            if ("洗罐".equals(target)) {
+                throw new BizException("该罐已有待执行的洗罐安排 " + active.getWashNo()
+                        + "，请在排程里开始清洗，不能绕过安排手动转入洗罐");
+            }
+        }
         // 规则③：超 72 小时未洗的罐不允许继续运行
         if ("运行".equals(target) && p.isWashDue()) {
-            throw new BizException("距上次洗罐已 " + p.getHoursSinceWash()
-                    + " 小时，超过 72 小时必须先洗罐");
+            throw new BizException("距上次洗罐已 " + p.getHoursSinceWash() + " 小时，超过 "
+                    + Dict.PAN_WASH_DUE_HOURS + " 小时必须先洗罐");
         }
         p.setStatus(target);
         return panRepository.save(p);
+    }
+
+    /** 该罐当前未完成的洗罐安排（待执行 / 清洗中），无则 null；正常至多一笔 */
+    private PanWash findActiveWash(Long panId) {
+        List<PanWash> actives = washRepository.findActiveByPanId(panId);
+        return actives.isEmpty() ? null : actives.get(0);
     }
 
     /** 在运罐体总容积（立方米） */
